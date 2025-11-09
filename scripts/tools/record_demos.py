@@ -40,8 +40,52 @@ parser.add_argument(
     help=(
         "Teleop device. Set here (legacy) or via the environment config. If using the environment config, pass the"
         " device key/name defined under 'teleop_devices' (it can be a custom name, not necessarily 'handtracking')."
-        " Built-ins: keyboard, spacemouse, gamepad. Not all tasks support all built-ins."
+        " Built-ins: keyboard, spacemouse, gamepad. Local extensions: mediapipe. Not all tasks support all devices."
     ),
+)
+parser.add_argument(
+    "--mediapipe_mode",
+    type=str,
+    choices=("single", "bimanual"),
+    default="single",
+    help="MediaPipe teleop operating mode. 'bimanual' is reserved for future use.",
+)
+parser.add_argument(
+    "--mediapipe_primary_hand",
+    type=str,
+    choices=("auto", "left", "right"),
+    default="right",
+    help="Preferred hand label to drive the primary gripper when using MediaPipe teleop.",
+)
+parser.add_argument(
+    "--mediapipe_camera_index",
+    type=int,
+    default=0,
+    help="Camera index passed to OpenCV when initializing MediaPipe teleop.",
+)
+parser.add_argument(
+    "--mediapipe_disable_fallback",
+    action="store_true",
+    default=False,
+    help="Disable fallback to the opposite hand if the preferred hand is not detected.",
+)
+parser.add_argument(
+    "--mediapipe_disable_mirroring",
+    action="store_true",
+    default=False,
+    help="Disable mirroring of left-hand coordinates into the right-handed frame.",
+)
+parser.add_argument(
+    "--mediapipe_show_debug",
+    action="store_true",
+    default=False,
+    help="Force-enable the MediaPipe debug overlay window, even when running headless is requested.",
+)
+parser.add_argument(
+    "--mediapipe_hide_debug",
+    action="store_true",
+    default=False,
+    help="Force-disable the MediaPipe debug overlay window regardless of headless mode.",
 )
 parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
@@ -85,6 +129,9 @@ if "handtracking" in args_cli.teleop_device.lower():
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+if "OpenArm" in args_cli.task:
+    import openarm  # noqa: F401
+
 """Rest everything follows."""
 
 
@@ -110,14 +157,19 @@ if args_cli.enable_pinocchio:
     import isaaclab_tasks.manager_based.locomanipulation.pick_place  # noqa: F401
 
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg, ManagerBasedRLMimicEnv
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
 from isaaclab.envs.ui import EmptyWindow
 from isaaclab.managers import DatasetExportMode
+import isaaclab.utils.math as PoseUtils
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+if TYPE_CHECKING:  # pragma: no cover
+    from openarm.teleop.mediapipe_se3 import MediaPipeSe3Teleop, MediaPipeSe3TeleopCfg
 
 
 class RateLimiter:
@@ -276,15 +328,55 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
         if hasattr(env_cfg, "teleop_devices") and args_cli.teleop_device in env_cfg.teleop_devices.devices:
             teleop_interface = create_teleop_device(args_cli.teleop_device, env_cfg.teleop_devices.devices, callbacks)
         else:
+            device_name = args_cli.teleop_device.lower()
             omni.log.warn(f"No teleop device '{args_cli.teleop_device}' found in environment config. Creating default.")
-            # Create fallback teleop device
-            if args_cli.teleop_device.lower() == "keyboard":
+            if device_name == "keyboard":
                 teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
-            elif args_cli.teleop_device.lower() == "spacemouse":
+            elif device_name == "spacemouse":
                 teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
+            elif device_name == "mediapipe":
+                try:
+                    from openarm.teleop.mediapipe_se3 import MediaPipeSe3Teleop, MediaPipeSe3TeleopCfg  # type: ignore[attr-defined]
+
+                    sim_device = getattr(getattr(env_cfg, "sim", None), "device", "cpu")
+                    mode = args_cli.mediapipe_mode
+                    if mode == "bimanual":
+                        omni.log.warn(
+                            "MediaPipe teleop bimanual mode is not yet supported; defaulting to single-hand control."
+                        )
+                        mode = "single"
+
+                    show_debug = not getattr(args_cli, "headless", False)
+                    if args_cli.mediapipe_show_debug and args_cli.mediapipe_hide_debug:
+                        omni.log.warn(
+                            "Both --mediapipe_show_debug and --mediapipe_hide_debug specified; disabling the debug overlay."
+                        )
+                        show_debug = False
+                    elif args_cli.mediapipe_show_debug:
+                        show_debug = True
+                    elif args_cli.mediapipe_hide_debug:
+                        show_debug = False
+
+                    teleop_cfg = MediaPipeSe3TeleopCfg(
+                        sim_device=sim_device,
+                        mode=mode,
+                        primary_hand=args_cli.mediapipe_primary_hand,
+                        allow_hand_fallback=not args_cli.mediapipe_disable_fallback,
+                        mirror_left_hand=not args_cli.mediapipe_disable_mirroring,
+                        camera_index=args_cli.mediapipe_camera_index,
+                        show_debug=show_debug,
+                    )
+                    teleop_interface = MediaPipeSe3Teleop(cfg=teleop_cfg)
+                    omni.log.info("MediaPipe teleop active: press 's' to start recording, 'p' to pause, 'r' to reset.")
+                except ImportError as exc:
+                    omni.log.error("MediaPipe teleop requires 'mediapipe' and 'opencv-python'.")
+                    omni.log.error(
+                        "Install with: IsaacLab/_isaac_sim/python.sh -m pip install mediapipe opencv-python"
+                    )
+                    raise
             else:
                 omni.log.error(f"Unsupported teleop device: {args_cli.teleop_device}")
-                omni.log.error("Supported devices: keyboard, spacemouse, handtracking")
+                omni.log.error("Supported devices: keyboard, spacemouse, handtracking, mediapipe")
                 exit(1)
 
             # Add callbacks to fallback device
@@ -299,6 +391,53 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
         exit(1)
 
     return teleop_interface
+
+
+def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> torch.Tensor | None:
+    """Project an SE(3) teleop command to the environment's action space when using Mimic envs.
+
+    The default keyboard/spacemouse teleop returns a 7-D vector (6D delta pose + binary gripper).
+    Mimic manager environments expect joint targets, so we lift the delta pose into the robot's
+    action space through the environment helper.
+    """
+
+    env_impl = env.unwrapped
+    if not isinstance(env_impl, ManagerBasedRLMimicEnv):
+        return None
+
+    if command.dim() > 2 or command.numel() < 7:
+        return None
+
+    expected_dim = getattr(env_impl.action_manager, "total_action_dim", None)
+    if expected_dim is not None and command.numel() == expected_dim:
+        return None
+
+    command_1d = command.reshape(-1)
+    if command_1d.numel() < 7:
+        return None
+
+    eef_name = getattr(env_impl, "_eef_name", None)
+    if eef_name is None:
+        subtask_cfgs = getattr(env_impl.cfg, "subtask_configs", {})
+        if isinstance(subtask_cfgs, dict) and subtask_cfgs:
+            eef_name = next(iter(subtask_cfgs.keys()))
+    if eef_name is None:
+        return None
+
+    device = env_impl.device
+    delta_pose = command_1d[:6].to(dtype=torch.float32, device=device).unsqueeze(0)
+    gripper = command_1d[6:].to(dtype=torch.float32, device=device).unsqueeze(0)
+
+    current_pose = env_impl.get_robot_eef_pose(eef_name, env_ids=[0])
+    current_pose = current_pose.to(device)
+    curr_pos, curr_rot_matrix = PoseUtils.unmake_pose(current_pose)
+    curr_quat = PoseUtils.quat_from_matrix(curr_rot_matrix)
+
+    target_pos, target_quat = PoseUtils.apply_delta_pose(curr_pos, curr_quat, delta_pose)
+    target_pose = PoseUtils.make_pose(target_pos, PoseUtils.matrix_from_quat(target_quat))
+
+    action_tensor = env_impl.target_eef_pose_to_action({eef_name: target_pose}, {eef_name: gripper})
+    return action_tensor.squeeze(0)
 
 
 def setup_ui(label_text: str, env: gym.Env) -> InstructionDisplay:
@@ -453,8 +592,12 @@ def run_simulation_loop(
         while simulation_app.is_running():
             # Get keyboard command
             action = teleop_interface.advance()
+            converted_action = convert_se3_command_to_env_action(env, action)
+            if converted_action is not None:
+                action = converted_action
+            action = action.to(env.unwrapped.device)
             # Expand to batch dimension
-            actions = action.repeat(env.num_envs, 1)
+            actions = action.unsqueeze(0).repeat(env.num_envs, 1)
 
             # Perform action on environment
             if running_recording_instance:
