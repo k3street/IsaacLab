@@ -48,7 +48,7 @@ parser.add_argument(
     type=str,
     choices=("single", "bimanual"),
     default="single",
-    help="MediaPipe teleop operating mode. 'bimanual' is reserved for future use.",
+    help="MediaPipe teleop operating mode. Use 'bimanual' for dual-arm skeleton retargeting.",
 )
 parser.add_argument(
     "--mediapipe_primary_hand",
@@ -86,6 +86,12 @@ parser.add_argument(
     action="store_true",
     default=False,
     help="Force-disable the MediaPipe debug overlay window regardless of headless mode.",
+)
+parser.add_argument(
+    "--mediapipe_debug_log",
+    type=str,
+    default=None,
+    help="Path to append MediaPipe teleop debug messages (panel/overlay errors).",
 )
 parser.add_argument(
     "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
@@ -159,6 +165,7 @@ if args_cli.enable_pinocchio:
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg, ManagerBasedRLMimicEnv
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
 from isaaclab.envs.ui import EmptyWindow
@@ -340,11 +347,6 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
 
                     sim_device = getattr(getattr(env_cfg, "sim", None), "device", "cpu")
                     mode = args_cli.mediapipe_mode
-                    if mode == "bimanual":
-                        omni.log.warn(
-                            "MediaPipe teleop bimanual mode is not yet supported; defaulting to single-hand control."
-                        )
-                        mode = "single"
 
                     show_debug = not getattr(args_cli, "headless", False)
                     if args_cli.mediapipe_show_debug and args_cli.mediapipe_hide_debug:
@@ -365,6 +367,7 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
                         mirror_left_hand=not args_cli.mediapipe_disable_mirroring,
                         camera_index=args_cli.mediapipe_camera_index,
                         show_debug=show_debug,
+                        debug_log_path=args_cli.mediapipe_debug_log,
                     )
                     teleop_interface = MediaPipeSe3Teleop(cfg=teleop_cfg)
                     omni.log.info("MediaPipe teleop active: press 's' to start recording, 'p' to pause, 'r' to reset.")
@@ -402,6 +405,21 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
     """
 
     env_impl = env.unwrapped
+
+    # Handle bimanual teleoperation by retargeting both wrists to joint actions via differential IK.
+    if args_cli.mediapipe_mode == "bimanual":
+        actions_cfg = getattr(env_impl.cfg, "actions", None)
+        has_dual_arm = actions_cfg is not None and hasattr(actions_cfg, "left_arm_action") and hasattr(actions_cfg, "right_arm_action")
+        if not has_dual_arm:
+            omni.log.error(
+                "MediaPipe bimanual teleop requires a dual-arm environment (e.g., Isaac-Grasp-Cube-OpenArm-Bi-v0). "
+                "Switch to a bimanual task or launch with --mediapipe_mode single."
+            )
+            exit(1)
+
+        adapter = _BimanualIkAdapterCache.get_or_create(env_impl)
+        return adapter.delta_pose_to_action(command)
+
     if not isinstance(env_impl, ManagerBasedRLMimicEnv):
         return None
 
@@ -438,6 +456,180 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
 
     action_tensor = env_impl.target_eef_pose_to_action({eef_name: target_pose}, {eef_name: gripper})
     return action_tensor.squeeze(0)
+
+
+class _BimanualIkAdapterCache:
+    _CACHE: dict[int, "_BimanualIkAdapter"] = {}
+
+    @classmethod
+    def get_or_create(cls, env_impl) -> "_BimanualIkAdapter":
+        key = id(env_impl)
+        adapter = cls._CACHE.get(key)
+        if adapter is None:
+            adapter = _BimanualIkAdapter(env_impl)
+            cls._CACHE[key] = adapter
+        return adapter
+
+
+class _BimanualIkAdapter:
+    """Converts dual-arm delta pose commands into joint-space actions via differential IK."""
+
+    def __init__(self, env_impl):
+        self._env = env_impl
+        self._device = env_impl.device
+        self._robot = env_impl.scene["robot"]
+        self._controllers: dict[str, DifferentialIKController] = {}
+        self._arm_terms: dict[str, object] = {}
+        self._arm_joint_ids: dict[str, list[int]] = {}
+        self._arm_action_dim: dict[str, int] = {}
+        self._arm_scale: dict[str, torch.Tensor] = {}
+        self._arm_offset: dict[str, torch.Tensor] = {}
+        self._eef_body_idx: dict[str, int] = {}
+        self._jacobian_body_idx: dict[str, int] = {}
+        self._jacobian_joint_ids: dict[str, list[int]] = {}
+        self._gripper_available: dict[str, bool] = {}
+        self._ensure_handles()
+
+    def delta_pose_to_action(self, command: torch.Tensor) -> torch.Tensor:
+        if command.dim() != 1:
+            command = command.reshape(-1)
+        if command.numel() < 14:
+            omni.log.error(
+                "Bimanual teleop command is underspecified (expected 14 floats, got %d). "
+                "Falling back to single-arm conversion.",
+                command.numel(),
+            )
+            return command.reshape(-1)
+
+        device_cmd = command.to(dtype=torch.float32, device=self._device)
+        left_action = self._compute_arm_action("left", device_cmd[:6])
+        right_action = self._compute_arm_action("right", device_cmd[7:13])
+
+        pieces = [left_action, right_action]
+
+        if self._gripper_available.get("left", False):
+            pieces.append(device_cmd[6:7].clone())
+        if self._gripper_available.get("right", False):
+            pieces.append(device_cmd[13:14].clone())
+
+        action_vec = torch.cat(pieces, dim=0)
+        expected_dim = self._env.action_manager.total_action_dim
+        if action_vec.numel() != expected_dim:
+            omni.log.error(
+                "Bimanual IK adapter produced %d action dimensions but environment expects %d.",
+                action_vec.numel(),
+                expected_dim,
+            )
+            exit(1)
+        return action_vec
+
+    def _compute_arm_action(self, arm: str, delta_pose_vec: torch.Tensor) -> torch.Tensor:
+        controller = self._controllers[arm]
+        joint_ids = self._arm_joint_ids[arm]
+        action_dim = self._arm_action_dim[arm]
+
+        curr_pos, curr_quat = self._get_eef_pose_in_base(arm)
+        curr_pos = curr_pos[:1]
+        curr_quat = curr_quat[:1]
+
+        delta_pose = delta_pose_vec.unsqueeze(0)
+        target_pos, target_quat = PoseUtils.apply_delta_pose(curr_pos, curr_quat, delta_pose)
+        command_pose = torch.cat([target_pos, target_quat], dim=1)
+        controller.set_command(command_pose, curr_pos, curr_quat)
+
+        jacobian = self._compute_frame_jacobian(arm)[:1]
+        joint_pos_curr = self._robot.data.joint_pos[:1, joint_ids]
+        joint_pos_des = controller.compute(curr_pos, curr_quat, jacobian, joint_pos_curr)
+
+        scale = self._arm_scale[arm]
+        offset = self._arm_offset[arm]
+        arm_action = (joint_pos_des.squeeze(0) - offset) / scale
+        arm_action = torch.clamp(arm_action, -1.0, 1.0)
+        return arm_action.reshape(action_dim)
+
+    def _ensure_handles(self) -> None:
+        if self._controllers:
+            return
+
+        robot = self._robot
+        action_manager = self._env.action_manager
+
+        arm_defs = {
+            "left": {
+                "term_name": "left_arm_action",
+                "gripper_term": "left_gripper_action",
+                "body_name": "openarm_left_hand",
+            },
+            "right": {
+                "term_name": "right_arm_action",
+                "gripper_term": "right_gripper_action",
+                "body_name": "openarm_right_hand",
+            },
+        }
+
+        for arm, meta in arm_defs.items():
+            term = action_manager.get_term(meta["term_name"])
+            self._arm_terms[arm] = term
+
+            joint_ids_attr = term._joint_ids  # pylint: disable=protected-access
+            if isinstance(joint_ids_attr, slice):
+                joint_ids = list(range(robot.num_joints))[joint_ids_attr]
+            else:
+                joint_ids = list(joint_ids_attr)
+            self._arm_joint_ids[arm] = joint_ids
+            self._arm_action_dim[arm] = len(joint_ids)
+
+            scale_attr = term._scale  # pylint: disable=protected-access
+            if isinstance(scale_attr, torch.Tensor):
+                scale_tensor = scale_attr[0, : self._arm_action_dim[arm]].clone().detach()
+            else:
+                scale_tensor = torch.full((self._arm_action_dim[arm],), float(scale_attr), dtype=torch.float32)
+            offset_attr = term._offset  # pylint: disable=protected-access
+            if isinstance(offset_attr, torch.Tensor):
+                offset_tensor = offset_attr[0, : self._arm_action_dim[arm]].clone().detach()
+            else:
+                offset_tensor = torch.full((self._arm_action_dim[arm],), float(offset_attr), dtype=torch.float32)
+            self._arm_scale[arm] = scale_tensor.to(self._device)
+            self._arm_offset[arm] = offset_tensor.to(self._device)
+
+            body_ids, _ = robot.find_bodies(meta["body_name"])
+            if not body_ids:
+                raise RuntimeError(f"Failed to resolve end-effector body for {arm} arm")
+            self._eef_body_idx[arm] = body_ids[0]
+
+            if robot.is_fixed_base:
+                self._jacobian_body_idx[arm] = self._eef_body_idx[arm] - 1
+                self._jacobian_joint_ids[arm] = joint_ids
+            else:
+                self._jacobian_body_idx[arm] = self._eef_body_idx[arm]
+                self._jacobian_joint_ids[arm] = [jid + 6 for jid in joint_ids]
+
+            ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="svd")
+            self._controllers[arm] = DifferentialIKController(cfg=ik_cfg, num_envs=self._env.num_envs, device=self._device)
+
+            try:
+                action_manager.get_term(meta["gripper_term"])
+                self._gripper_available[arm] = True
+            except KeyError:
+                self._gripper_available[arm] = False
+
+    def _get_eef_pose_in_base(self, arm: str) -> tuple[torch.Tensor, torch.Tensor]:
+        robot = self._robot
+        body_idx = self._eef_body_idx[arm]
+        ee_pos_w = robot.data.body_pos_w[:, body_idx]
+        ee_quat_w = robot.data.body_quat_w[:, body_idx]
+        root_pos_w = robot.data.root_pos_w
+        root_quat_w = robot.data.root_quat_w
+        return PoseUtils.subtract_frame_transforms(root_pos_w, root_quat_w, ee_pos_w, ee_quat_w)
+
+    def _compute_frame_jacobian(self, arm: str) -> torch.Tensor:
+        robot = self._robot
+        jacobian = robot.root_physx_view.get_jacobians()[:, self._jacobian_body_idx[arm], :, self._jacobian_joint_ids[arm]]
+        base_quat = robot.data.root_quat_w
+        base_rot_matrix = PoseUtils.matrix_from_quat(PoseUtils.quat_inv(base_quat))
+        jacobian_pos = torch.bmm(base_rot_matrix, jacobian[:, :3, :])
+        jacobian_rot = torch.bmm(base_rot_matrix, jacobian[:, 3:, :])
+        return torch.cat([jacobian_pos, jacobian_rot], dim=1)
 
 
 def setup_ui(label_text: str, env: gym.Env) -> InstructionDisplay:
