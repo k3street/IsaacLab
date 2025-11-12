@@ -143,12 +143,12 @@ if "OpenArm" in args_cli.task:
 
 # Third-party imports
 import gymnasium as gym
+import logging
 import os
 import time
 import torch
 
-# Omniverse logger
-import omni.log
+import omni
 import omni.ui as ui
 
 from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
@@ -174,6 +174,9 @@ import isaaclab.utils.math as PoseUtils
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+# import logger
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:  # pragma: no cover
     from openarm.teleop.mediapipe_se3 import MediaPipeSe3Teleop, MediaPipeSe3TeleopCfg
@@ -260,7 +263,7 @@ def create_environment_config(
         env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
         env_cfg.env_name = args_cli.task.split(":")[-1]
     except Exception as e:
-        omni.log.error(f"Failed to parse environment configuration: {e}")
+        logger.error(f"Failed to parse environment configuration: {e}")
         exit(1)
 
     # extract success checking function to invoke in the main loop
@@ -269,7 +272,7 @@ def create_environment_config(
         success_term = env_cfg.terminations.success
         env_cfg.terminations.success = None
     else:
-        omni.log.warn(
+        logger.warning(
             "No success termination term was found in the environment."
             " Will not be able to mark recorded demos as successful."
         )
@@ -310,7 +313,7 @@ def create_environment(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg) -> gym.En
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
         return env
     except Exception as e:
-        omni.log.error(f"Failed to create environment: {e}")
+        logger.error(f"Failed to create environment: {e}")
         exit(1)
 
 
@@ -336,7 +339,10 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
             teleop_interface = create_teleop_device(args_cli.teleop_device, env_cfg.teleop_devices.devices, callbacks)
         else:
             device_name = args_cli.teleop_device.lower()
-            omni.log.warn(f"No teleop device '{args_cli.teleop_device}' found in environment config. Creating default.")
+            warn_msg = f"No teleop device '{args_cli.teleop_device}' found in environment config. Creating default."
+            logger.warning(warn_msg)
+            omni.log.warn(warn_msg)
+            # Create fallback teleop device
             if device_name == "keyboard":
                 teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
             elif device_name == "spacemouse":
@@ -372,25 +378,31 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
                     teleop_interface = MediaPipeSe3Teleop(cfg=teleop_cfg)
                     omni.log.info("MediaPipe teleop active: press 's' to start recording, 'p' to pause, 'r' to reset.")
                 except ImportError as exc:
-                    omni.log.error("MediaPipe teleop requires 'mediapipe' and 'opencv-python'.")
-                    omni.log.error(
-                        "Install with: IsaacLab/_isaac_sim/python.sh -m pip install mediapipe opencv-python"
-                    )
+                    err_msg = "MediaPipe teleop requires 'mediapipe' and 'opencv-python'."
+                    omni.log.error(err_msg)
+                    logger.error(err_msg)
+                    install_msg = "Install with: IsaacLab/_isaac_sim/python.sh -m pip install mediapipe opencv-python"
+                    omni.log.error(install_msg)
+                    logger.error(install_msg)
                     raise
             else:
-                omni.log.error(f"Unsupported teleop device: {args_cli.teleop_device}")
-                omni.log.error("Supported devices: keyboard, spacemouse, handtracking, mediapipe")
+                err_msg = f"Unsupported teleop device: {args_cli.teleop_device}"
+                omni.log.error(err_msg)
+                logger.error(err_msg)
+                support_msg = "Supported devices: keyboard, spacemouse, handtracking, mediapipe"
+                omni.log.error(support_msg)
+                logger.error(support_msg)
                 exit(1)
 
             # Add callbacks to fallback device
             for key, callback in callbacks.items():
                 teleop_interface.add_callback(key, callback)
     except Exception as e:
-        omni.log.error(f"Failed to create teleop device: {e}")
+        logger.error(f"Failed to create teleop device: {e}")
         exit(1)
 
     if teleop_interface is None:
-        omni.log.error("Failed to create teleop interface")
+        logger.error("Failed to create teleop interface")
         exit(1)
 
     return teleop_interface
