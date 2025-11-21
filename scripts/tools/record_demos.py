@@ -26,6 +26,20 @@ optional arguments:
 # Standard library imports
 import argparse
 import contextlib
+import sys
+import os
+
+# Add IsaacLab source to path
+source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../source"))
+sys.path.append(os.path.join(source_dir, "isaaclab"))
+sys.path.append(os.path.join(source_dir, "isaaclab_tasks"))
+sys.path.append(os.path.join(source_dir, "isaaclab_mimic"))
+sys.path.append(os.path.join(source_dir, "isaaclab_assets"))
+sys.path.append(os.path.join(source_dir, "isaaclab_rl"))
+
+# Add OpenArm source to path
+openarm_source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../openarm_isaac_lab/source/openarm"))
+sys.path.append(openarm_source_dir)
 
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
@@ -166,7 +180,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
-from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg, ManagerBasedRLMimicEnv
+from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg, ManagerBasedRLMimicEnv, ManagerBasedRLEnv
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg
 from isaaclab.envs.ui import EmptyWindow
 from isaaclab.managers import DatasetExportMode
@@ -432,7 +446,15 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
         adapter = _BimanualIkAdapterCache.get_or_create(env_impl)
         return adapter.delta_pose_to_action(command)
 
-    if not isinstance(env_impl, ManagerBasedRLMimicEnv):
+    # Handle single-arm teleoperation with IK for non-Mimic environments
+    # This is specifically for cases like OpenArm where we have 8 actions (7 joints + 1 gripper)
+    # but the teleop gives 7 (6 pose + 1 gripper).
+    expected_dim = getattr(env_impl.action_manager, "total_action_dim", None)
+    if expected_dim == 8 and command.numel() == 7:
+         adapter = _SingleArmIkAdapterCache.get_or_create(env_impl)
+         return adapter.delta_pose_to_action(command)
+
+    if not isinstance(env_impl, (ManagerBasedRLMimicEnv, ManagerBasedRLEnv)):
         return None
 
     if command.dim() > 2 or command.numel() < 7:
@@ -637,6 +659,174 @@ class _BimanualIkAdapter:
     def _compute_frame_jacobian(self, arm: str) -> torch.Tensor:
         robot = self._robot
         jacobian = robot.root_physx_view.get_jacobians()[:, self._jacobian_body_idx[arm], :, self._jacobian_joint_ids[arm]]
+        base_quat = robot.data.root_quat_w
+        base_rot_matrix = PoseUtils.matrix_from_quat(PoseUtils.quat_inv(base_quat))
+        jacobian_pos = torch.bmm(base_rot_matrix, jacobian[:, :3, :])
+        jacobian_rot = torch.bmm(base_rot_matrix, jacobian[:, 3:, :])
+        return torch.cat([jacobian_pos, jacobian_rot], dim=1)
+
+
+class _SingleArmIkAdapterCache:
+    _CACHE: dict[int, "_SingleArmIkAdapter"] = {}
+
+    @classmethod
+    def get_or_create(cls, env_impl) -> "_SingleArmIkAdapter":
+        key = id(env_impl)
+        adapter = cls._CACHE.get(key)
+        if adapter is None:
+            adapter = _SingleArmIkAdapter(env_impl)
+            cls._CACHE[key] = adapter
+        return adapter
+
+
+class _SingleArmIkAdapter:
+    """Converts single-arm delta pose commands into joint-space actions via differential IK."""
+
+    def __init__(self, env_impl):
+        self._env = env_impl
+        self._device = env_impl.device
+        self._robot = env_impl.scene["robot"]
+        self._controller: DifferentialIKController | None = None
+        self._arm_term = None
+        self._arm_joint_ids: list[int] = []
+        self._arm_action_dim: int = 0
+        self._arm_scale: torch.Tensor | None = None
+        self._arm_offset: torch.Tensor | None = None
+        self._eef_body_idx: int = -1
+        self._jacobian_body_idx: int = -1
+        self._jacobian_joint_ids: list[int] = []
+        self._gripper_available: bool = False
+        self._ensure_handles()
+
+    def delta_pose_to_action(self, command: torch.Tensor) -> torch.Tensor:
+        if command.dim() != 1:
+            command = command.reshape(-1)
+        
+        # Command is 7 dims: 6 pose + 1 gripper
+        if command.numel() < 7:
+             return command
+
+        device_cmd = command.to(dtype=torch.float32, device=self._device)
+        
+        arm_action = self._compute_arm_action(device_cmd[:6])
+        
+        pieces = [arm_action]
+        if self._gripper_available:
+            pieces.append(device_cmd[6:7].clone())
+            
+        action_vec = torch.cat(pieces, dim=0)
+        return action_vec
+
+    def _compute_arm_action(self, delta_pose_vec: torch.Tensor) -> torch.Tensor:
+        controller = self._controller
+        joint_ids = self._arm_joint_ids
+        action_dim = self._arm_action_dim
+
+        curr_pos, curr_quat = self._get_eef_pose_in_base()
+        curr_pos = curr_pos[:1]
+        curr_quat = curr_quat[:1]
+
+        delta_pose = delta_pose_vec.unsqueeze(0)
+        target_pos, target_quat = PoseUtils.apply_delta_pose(curr_pos, curr_quat, delta_pose)
+        command_pose = torch.cat([target_pos, target_quat], dim=1)
+        controller.set_command(command_pose, curr_pos, curr_quat)
+
+        jacobian = self._compute_frame_jacobian()[:1]
+        joint_pos_curr = self._robot.data.joint_pos[:1, joint_ids]
+        joint_pos_des = controller.compute(curr_pos, curr_quat, jacobian, joint_pos_curr)
+
+        scale = self._arm_scale
+        offset = self._arm_offset
+        arm_action = (joint_pos_des.squeeze(0) - offset) / scale
+        arm_action = torch.clamp(arm_action, -1.0, 1.0)
+        return arm_action.reshape(action_dim)
+
+    def _ensure_handles(self) -> None:
+        if self._controller:
+            return
+
+        robot = self._robot
+        action_manager = self._env.action_manager
+        
+        # Try to find arm action term
+        term_name = "arm_action"
+        try:
+            term = action_manager.get_term(term_name)
+        except KeyError:
+            omni.log.error(f"Could not find action term '{term_name}' for SingleArmIkAdapter.")
+            return 
+
+        self._arm_term = term
+
+        joint_ids_attr = term._joint_ids  # pylint: disable=protected-access
+        if isinstance(joint_ids_attr, slice):
+            joint_ids = list(range(robot.num_joints))[joint_ids_attr]
+        else:
+            joint_ids = list(joint_ids_attr)
+        self._arm_joint_ids = joint_ids
+        self._arm_action_dim = len(joint_ids)
+
+        scale_attr = term._scale  # pylint: disable=protected-access
+        if isinstance(scale_attr, torch.Tensor):
+            scale_tensor = scale_attr[0, : self._arm_action_dim].clone().detach()
+        else:
+            scale_tensor = torch.full((self._arm_action_dim,), float(scale_attr), dtype=torch.float32)
+        offset_attr = term._offset  # pylint: disable=protected-access
+        if isinstance(offset_attr, torch.Tensor):
+            offset_tensor = offset_attr[0, : self._arm_action_dim].clone().detach()
+        else:
+            offset_tensor = torch.full((self._arm_action_dim,), float(offset_attr), dtype=torch.float32)
+        self._arm_scale = scale_tensor.to(self._device)
+        self._arm_offset = offset_tensor.to(self._device)
+
+        # Determine body name
+        body_name = "openarm_hand"
+        if hasattr(self._env.cfg, "commands") and hasattr(self._env.cfg.commands, "object_pose"):
+             body_name = self._env.cfg.commands.object_pose.body_name
+        
+        body_ids, _ = robot.find_bodies(body_name)
+        if not body_ids:
+            # Fallback to searching for something that looks like a hand or end effector
+            omni.log.warn(f"Could not find body '{body_name}', trying to guess...")
+            for name in robot.data.body_names:
+                if "hand" in name or "ee" in name or "gripper" in name:
+                    body_name = name
+                    body_ids, _ = robot.find_bodies(body_name)
+                    break
+        
+        if not body_ids:
+            raise RuntimeError(f"Failed to resolve end-effector body for SingleArmIkAdapter. Expected '{body_name}' or similar.")
+        
+        self._eef_body_idx = body_ids[0]
+
+        if robot.is_fixed_base:
+            self._jacobian_body_idx = self._eef_body_idx - 1
+            self._jacobian_joint_ids = joint_ids
+        else:
+            self._jacobian_body_idx = self._eef_body_idx
+            self._jacobian_joint_ids = [jid + 6 for jid in joint_ids]
+
+        ik_cfg = DifferentialIKControllerCfg(command_type="pose", use_relative_mode=False, ik_method="svd")
+        self._controller = DifferentialIKController(cfg=ik_cfg, num_envs=self._env.num_envs, device=self._device)
+
+        try:
+            action_manager.get_term("gripper_action")
+            self._gripper_available = True
+        except KeyError:
+            self._gripper_available = False
+
+    def _get_eef_pose_in_base(self) -> tuple[torch.Tensor, torch.Tensor]:
+        robot = self._robot
+        body_idx = self._eef_body_idx
+        ee_pos_w = robot.data.body_pos_w[:, body_idx]
+        ee_quat_w = robot.data.body_quat_w[:, body_idx]
+        root_pos_w = robot.data.root_pos_w
+        root_quat_w = robot.data.root_quat_w
+        return PoseUtils.subtract_frame_transforms(root_pos_w, root_quat_w, ee_pos_w, ee_quat_w)
+
+    def _compute_frame_jacobian(self) -> torch.Tensor:
+        robot = self._robot
+        jacobian = robot.root_physx_view.get_jacobians()[:, self._jacobian_body_idx, :, self._jacobian_joint_ids]
         base_quat = robot.data.root_quat_w
         base_rot_matrix = PoseUtils.matrix_from_quat(PoseUtils.quat_inv(base_quat))
         jacobian_pos = torch.bmm(base_rot_matrix, jacobian[:, :3, :])
