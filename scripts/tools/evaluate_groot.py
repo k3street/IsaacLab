@@ -24,6 +24,7 @@ import time
 import json
 import tempfile
 from huggingface_hub import hf_hub_download
+import cv2
 
 # Add IsaacLab source to path
 source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../source"))
@@ -294,20 +295,59 @@ def main():
             action = policy.get_action(obs, env=env)
             
             # Apply Action
-            # If action is 32 dims (Groot default), slice to 16 (OpenArm)
+            # If action is 32 dims (Groot default), we need to map it to OpenArm's 16 dims
+            # OpenArm expects: [Left Arm (7), Right Arm (7), Left Gripper (1), Right Gripper (1)]
             if action.shape[-1] == 32:
-                # Assuming first 16 are the relevant joints/grippers
-                action = action[:, :16]
+                # Hypothesis: Groot outputs [Left Arm (7), Left Gripper (1), Right Arm (7), Right Gripper (1), ...]
+                # We remap to [Left Arm (7), Right Arm (7), Left Gripper (1), Right Gripper (1)]
+                
+                left_arm = action[:, 0:7]
+                left_gripper = action[:, 7:8]
+                right_arm = action[:, 8:15]
+                right_gripper = action[:, 15:16]
+                
+                # Reassemble for OpenArm
+                action = torch.cat([left_arm, right_arm, left_gripper, right_gripper], dim=-1)
+                
+                # DEBUG: Print Gripper Actions
+                if step_count % 20 == 0:
+                    print(f"Step {step_count} | Gripper Raw: L={left_gripper.item():.3f}, R={right_gripper.item():.3f}")
 
-            # If action is 14 dims (joints only), we might need to append gripper
+                # Reassemble for OpenArm
+                action = torch.cat([left_arm, right_arm, left_gripper, right_gripper], dim=-1)
             if action.shape[-1] == 14:
                 # Append gripper actions (open/close)
                 # For now, keep them open (positive) or closed (0)
                 gripper_action = torch.ones((action.shape[0], 2), device=env.device) * 0.04
                 action = torch.cat([action, gripper_action], dim=-1)
             
+            # DEBUG: Print Gripper Actions (indices 14, 15)
+            if step_count % 50 == 0:
+                print(f"Step {step_count}: Gripper Actions: {action[0, 14:].cpu().numpy()}")
+
             # Step
             obs, rew, terminated, truncated, info = env.step(action)
+
+            # Save camera images
+            if step_count % 10 == 0 and "vision" in obs:
+                for cam_name, img_tensor in obs["vision"].items():
+                    # Handle tensor to numpy
+                    if isinstance(img_tensor, torch.Tensor):
+                        img_np = img_tensor[0].cpu().numpy()
+                    else:
+                        img_np = img_tensor[0]
+                    
+                    # Handle float [0,1] -> uint8 [0,255]
+                    if img_np.dtype == np.float32 or img_np.dtype == np.float64:
+                        img_np = (img_np * 255).astype(np.uint8)
+                    
+                    # Handle RGB -> BGR for OpenCV
+                    if img_np.shape[-1] == 3:
+                        img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                    
+                    # Save
+                    filename = f"output_images/ep{episode_i}_step{step_count}_{cam_name}.png"
+                    cv2.imwrite(filename, img_np)
             
             step_count += 1
             
