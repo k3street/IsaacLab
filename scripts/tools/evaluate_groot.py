@@ -50,6 +50,9 @@ parser.add_argument("--model_path", type=str, default="nvidia/GR00T-N1.5-3B", he
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
+# Force enable cameras as Groot is a vision-based policy
+args_cli.enable_cameras = True
+
 # launch the simulator
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -65,6 +68,7 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.utils import get_device_from_parameters
+from lerobot.policies.groot.groot_n1 import GR00TN15, GR00TN15Config
 
 # -----------------------------------------------------------------------------
 # GROOT POLICY WRAPPER
@@ -76,58 +80,81 @@ class GrootPolicyWrapper:
         
         # 1. Load Config
         try:
-            self.cfg = PreTrainedConfig.from_pretrained(model_path)
+            # Try loading as a transformers config first
+            print(f"[Groot] Loading config as GR00TN15Config...")
+            self.cfg = GR00TN15Config.from_pretrained(model_path)
         except Exception as e:
-            print(f"[Groot] Standard config load failed: {e}.")
-            print(f"[Groot] Assuming {model_path} is a raw GR00T model checkpoint. Creating default GrootConfig.")
-            from lerobot.policies.groot.configuration_groot import GrootConfig
-            self.cfg = GrootConfig(base_model_path=model_path)
-            
-            # Manually populate features to satisfy validation
-            self.cfg.input_features = {
-                "observation.images.primary": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
-                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(self.cfg.max_state_dim,))
-            }
-            self.cfg.output_features = {
-                "action": PolicyFeature(type=FeatureType.ACTION, shape=(self.cfg.max_action_dim,))
-            }
+            print(f"[Groot] GR00TN15Config load failed: {e}")
+            # Fallback (should not happen if model is standard)
+            raise e
 
-            # Force disable flash attention in backbone config
-            self.cfg.backbone_cfg = {
-                'eagle_path': 'NVEagle/eagle_er-qwen3_1_7B-Siglip2_400M_stage1_5_128gpu_er_v7_1mlp_nops',
-                'load_bf16': False,
-                'project_to_dim': None,
-                'reproject_vision': False,
-                'select_layer': 12,
-                'tune_llm': False,
-                'tune_visual': True,
-                'use_flash_attention': False,
-            }
+        # Force disable flash attention in backbone config
+        if hasattr(self.cfg, 'backbone_cfg'):
+            print("[Groot] Disabling Flash Attention in config...")
+            self.cfg.backbone_cfg['use_flash_attention'] = False
+            # Also force eager implementation if possible (though backbone_cfg is a dict)
+            # The patch in groot_n1.py will handle the rest based on use_flash_attention=False
 
         self.cfg.pretrained_path = model_path
         self.cfg.device = device
         
+        print(f"[Groot] DEBUG: config type: {type(self.cfg)}")
+
         # 2. Create Policy
-        # We pass a dummy ds_meta to bypass the check in make_policy
-        # The config already has the features, so we don't need real metadata
-        class DummyDatasetMetadata:
-            def __init__(self):
-                self.features = {}
-        
-        self.policy = make_policy(self.cfg, ds_meta=DummyDatasetMetadata())
+        # Instantiate directly to ensure config is used
+        self.policy = GR00TN15.from_pretrained(model_path, config=self.cfg, trust_remote_code=True)
+        self.policy.to(self.device)
         self.policy.eval()
         
         # 3. Create Processors
-        self.preprocessor, self.postprocessor = make_pre_post_processors(
-            self.cfg, 
-            pretrained_path=model_path
-        )
+        # We need to create processors manually or use lerobot utils
+        # make_pre_post_processors expects a LeRobot config.
+        # We can try to create a dummy LeRobot config or just use the processors directly if we knew them.
+        # But wait, make_pre_post_processors loads from pretrained_path usually.
+        
+        # Let's try to use make_pre_post_processors with the path, ignoring the config argument if possible?
+        # make_pre_post_processors(config, pretrained_path=...)
+        # It uses config.input_features etc.
+        
+        # GR00TN15Config does NOT have input_features/output_features fields usually (transformers config).
+        # But the error message showed the config dict HAD 'input_features' etc?
+        # No, the error message showed 'action_dim', 'action_head_cfg', etc.
+        
+        # If we need preprocessors, we need the LeRobot config structure.
+        # Let's try to construct a minimal object that satisfies make_pre_post_processors
+        
+        from lerobot.policies.groot.configuration_groot import GrootConfig
+        # We can try to load GrootConfig just for processors, but NOT use it for the model
+        try:
+             self.lerobot_cfg = GrootConfig(base_model_path=model_path)
+             # Manually populate features as before
+             self.lerobot_cfg.input_features = {
+                "observation.images.primary": PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+                "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(64,))
+             }
+             self.lerobot_cfg.output_features = {
+                "action": PolicyFeature(type=FeatureType.ACTION, shape=(32,))
+             }
+        except Exception as e:
+             print(f"[Groot] Failed to create LeRobot config for processors: {e}")
+             self.lerobot_cfg = None
+
+        if self.lerobot_cfg:
+            self.preprocessor, self.postprocessor = make_pre_post_processors(
+                self.lerobot_cfg, 
+                pretrained_path=None
+            )
+        else:
+            print("[Groot] Warning: No preprocessors created.")
+            self.preprocessor = lambda x: x
+            self.postprocessor = lambda x: x
         
         print("[Groot] Model loaded successfully.")
         self.print_keys_once = True
 
     def reset(self):
-        self.policy.reset()
+        if hasattr(self.policy, "reset"):
+            self.policy.reset()
 
     def get_action(self, obs, env=None, instruction="grasp the cube"):
         """
@@ -140,7 +167,8 @@ class GrootPolicyWrapper:
         """
         # 1. Inspect expected keys on first run
         if self.print_keys_once:
-            print(f"[Groot] Expected Input Features: {self.cfg.input_features.keys()}")
+            if hasattr(self, 'lerobot_cfg') and self.lerobot_cfg:
+                print(f"[Groot] Expected Input Features: {self.lerobot_cfg.input_features.keys()}")
             self.print_keys_once = False
 
         # 2. Construct LeRobot Observation Dictionary
@@ -199,7 +227,13 @@ class GrootPolicyWrapper:
         lerobot_obs["text"] = [instruction] * obs["policy"].shape[0]
 
         # 3. Filter to only keys expected by the model
-        input_keys = set(self.cfg.input_features.keys())
+        # Use lerobot_cfg for feature keys if available
+        if hasattr(self, 'lerobot_cfg') and self.lerobot_cfg:
+            input_keys = set(self.lerobot_cfg.input_features.keys())
+        else:
+            # Fallback if no lerobot config
+            input_keys = {"observation.images.primary", "observation.state", "text"}
+            
         filtered_obs = {k: v for k, v in lerobot_obs.items() if k in input_keys}
         
         # 4. Run Inference
@@ -214,7 +248,11 @@ class GrootPolicyWrapper:
             pass
 
         with torch.inference_mode():
-            action = self.policy.select_action(filtered_obs)
+            output = self.policy.get_action(filtered_obs)
+            if hasattr(output, "get"):
+                action = output.get("action_pred", output.get("action", output))
+            else:
+                action = output
         
         # Postprocess
         action = self.postprocessor(action)
@@ -256,6 +294,11 @@ def main():
             action = policy.get_action(obs, env=env)
             
             # Apply Action
+            # If action is 32 dims (Groot default), slice to 16 (OpenArm)
+            if action.shape[-1] == 32:
+                # Assuming first 16 are the relevant joints/grippers
+                action = action[:, :16]
+
             # If action is 14 dims (joints only), we might need to append gripper
             if action.shape[-1] == 14:
                 # Append gripper actions (open/close)
