@@ -45,6 +45,7 @@ parser = argparse.ArgumentParser(description="Evaluate Groot Policy in Isaac Lab
 parser.add_argument("--task", type=str, default="Isaac-Grasp-Cube-OpenArm-Bi-Play-v0", help="Name of the task.")
 parser.add_argument("--num_demos", type=int, default=5, help="Number of episodes to evaluate.")
 parser.add_argument("--model_path", type=str, default="nvidia/GR00T-N1.5-3B", help="Path to Groot model weights or HF ID.")
+parser.add_argument("--max_steps", type=int, default=None, help="Maximum number of steps to run per episode.")
 # parser.add_argument("--enable_cameras", action="store_true", default=True, help="Enable cameras for vision-based policies.")
 
 # append AppLauncher cli args
@@ -205,6 +206,9 @@ class GrootPolicyWrapper:
             if "overhead_rgb" in obs["vision"]:
                 # LeRobot expects (B, C, H, W) usually, Isaac Lab gives (B, H, W, C)
                 img = obs["vision"]["overhead_rgb"]
+                # Normalize to [0, 1]
+                if img.dtype == torch.uint8:
+                    img = img.float() / 255.0
                 if img.shape[-1] == 3: # HWC -> CHW
                     img = img.permute(0, 3, 1, 2)
                 lerobot_obs["observation.images.top"] = img
@@ -214,12 +218,18 @@ class GrootPolicyWrapper:
             # Map wrist cameras
             if "left_wrist_rgb" in obs["vision"]:
                 img = obs["vision"]["left_wrist_rgb"]
+                # Normalize to [0, 1]
+                if img.dtype == torch.uint8:
+                    img = img.float() / 255.0
                 if img.shape[-1] == 3:
                     img = img.permute(0, 3, 1, 2)
                 lerobot_obs["observation.images.left_wrist"] = img
             
             if "right_wrist_rgb" in obs["vision"]:
                 img = obs["vision"]["right_wrist_rgb"]
+                # Normalize to [0, 1]
+                if img.dtype == torch.uint8:
+                    img = img.float() / 255.0
                 if img.shape[-1] == 3:
                     img = img.permute(0, 3, 1, 2)
                 lerobot_obs["observation.images.right_wrist"] = img
@@ -351,6 +361,10 @@ def main():
             
             step_count += 1
             
+            if args_cli.max_steps is not None and step_count >= args_cli.max_steps:
+                print(f"Episode {episode_i} finished after {step_count} steps (max_steps reached).")
+                break
+
             if terminated or truncated:
                 print(f"Episode {episode_i} finished after {step_count} steps.")
                 break
