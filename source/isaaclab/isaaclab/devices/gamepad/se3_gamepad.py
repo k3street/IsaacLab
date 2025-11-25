@@ -88,16 +88,23 @@ class Se3Gamepad(DeviceBase):
         # acquire omniverse interfaces
         self._appwindow = omni.appwindow.get_default_app_window()
         self._input = carb.input.acquire_input_interface()
-        
-        # Try to find a connected gamepad
+
+        # Allow developers to bypass the Carb listener (which sometimes drops
+        # events on Linux desktops) and rely purely on evdev polling.
+        force_evdev = os.environ.get("ISAACLAB_FORCE_EVDEV", "").lower() in {"1", "true", "yes", "on"}
+        if force_evdev:
+            print("[Se3Gamepad] ISAACLAB_FORCE_EVDEV set -> skipping Carb gamepad search and using evdev only.")
+
+        # Try to find a connected Carb gamepad unless we explicitly force evdev.
         self._gamepad = None
-        for i in range(8): # Check first 8 slots
-            gp = self._appwindow.get_gamepad(i)
-            if gp is not None:
-                name = self._input.get_gamepad_name(gp)
-                print(f"[Se3Gamepad] Found gamepad at index {i}: {gp} Name: {name}")
-                self._gamepad = gp
-                break
+        if not force_evdev:
+            for i in range(8):  # Check first 8 slots
+                gp = self._appwindow.get_gamepad(i)
+                if gp is not None:
+                    name = self._input.get_gamepad_name(gp)
+                    print(f"[Se3Gamepad] Found gamepad at index {i}: {gp} Name: {name}")
+                    self._gamepad = gp
+                    break
         
         self._evdev_device = None
         if self._gamepad is None:
