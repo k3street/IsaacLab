@@ -11,6 +11,13 @@ import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from scipy.spatial.transform import Rotation
+import os
+import select
+
+try:
+    import evdev
+except ImportError:
+    evdev = None
 
 import carb
 import omni
@@ -81,12 +88,62 @@ class Se3Gamepad(DeviceBase):
         # acquire omniverse interfaces
         self._appwindow = omni.appwindow.get_default_app_window()
         self._input = carb.input.acquire_input_interface()
-        self._gamepad = self._appwindow.get_gamepad(0)
+        
+        # Try to find a connected gamepad
+        self._gamepad = None
+        for i in range(8): # Check first 8 slots
+            gp = self._appwindow.get_gamepad(i)
+            if gp is not None:
+                name = self._input.get_gamepad_name(gp)
+                print(f"[Se3Gamepad] Found gamepad at index {i}: {gp} Name: {name}")
+                self._gamepad = gp
+                break
+        
+        self._evdev_device = None
+        if self._gamepad is None:
+            print(f"[Se3Gamepad] Carb failed to acquire gamepad. Checking for evdev devices...")
+            if evdev is not None:
+                base_path = "/dev/input/by-id"
+                if os.path.exists(base_path):
+                    for fname in os.listdir(base_path):
+                        if "Microsoft" in fname and "event-joystick" in fname:
+                            dev_path = os.path.join(base_path, fname)
+                            try:
+                                self._evdev_device = evdev.InputDevice(dev_path)
+                                print(f"[Se3Gamepad] Found evdev device: {self._evdev_device.name} at {dev_path}")
+                                break
+                            except Exception as e:
+                                print(f"[Se3Gamepad] Failed to open {dev_path}: {e}")
+                if self._evdev_device is None:
+                    # Fallback: try /dev/input/event*
+                    print("[Se3Gamepad] No Microsoft controller found in by-id. Scanning /dev/input/event*...")
+                    try:
+                        for i in range(30):
+                            path = f"/dev/input/event{i}"
+                            if os.path.exists(path):
+                                try:
+                                    d = evdev.InputDevice(path)
+                                    if "Xbox" in d.name or "Microsoft" in d.name or "Gamepad" in d.name:
+                                        self._evdev_device = d
+                                        print(f"[Se3Gamepad] Found evdev device: {d.name} at {path}")
+                                        break
+                                except:
+                                    pass
+                    except Exception as e:
+                        print(f"[Se3Gamepad] Error scanning events: {e}")
+
+        if self._gamepad is None and self._evdev_device is None:
+            print(f"[Se3Gamepad] Failed to acquire any gamepad (Carb or Evdev). Please check connection and drivers.")
+        
         # note: Use weakref on callbacks to ensure that this object can be deleted when its destructor is called
-        self._gamepad_sub = self._input.subscribe_to_gamepad_events(
-            self._gamepad,
-            lambda event, *args, obj=weakref.proxy(self): obj._on_gamepad_event(event, *args),
-        )
+        if self._gamepad is not None:
+            self._gamepad_sub = self._input.subscribe_to_gamepad_events(
+                self._gamepad,
+                lambda event, *args, obj=weakref.proxy(self): obj._on_gamepad_event(event, *args),
+            )
+        else:
+            self._gamepad_sub = None
+
         # bindings for gamepad to command
         self._create_key_bindings()
         # command buffers
@@ -150,6 +207,9 @@ class Se3Gamepad(DeviceBase):
                 - delta pose: First 6 elements as [x, y, z, rx, ry, rz] in meters and radians.
                 - gripper command: Last element as a binary value (+1.0 for open, -1.0 for close).
         """
+        if getattr(self, '_evdev_device', None):
+            self._poll_evdev()
+
         # -- resolve position command
         delta_pos = self._resolve_command_buffer(self._delta_pose_raw[:, :3])
         # -- resolve rotation command
@@ -164,6 +224,110 @@ class Se3Gamepad(DeviceBase):
 
         return torch.tensor(command, dtype=torch.float32, device=self._sim_device)
 
+    def _poll_evdev(self):
+        """Poll evdev device for events."""
+        try:
+            r, _, _ = select.select([self._evdev_device], [], [], 0.0)
+            if self._evdev_device in r:
+                for event in self._evdev_device.read():
+                    if event.type == evdev.ecodes.EV_ABS:
+                        val = event.value
+                        # Normalize stick values (approx -32768 to 32767)
+                        norm_val = 0.0
+                        if event.code in [0, 1, 3, 4]: # Sticks
+                            norm_val = val / 32768.0
+                            if abs(norm_val) < self.dead_zone:
+                                norm_val = 0.0
+                        elif event.code in [16, 17]: # D-Pad
+                            norm_val = float(val)
+                        
+                        # Map to internal state
+                        # Left Stick X -> Move Y
+                        if event.code == 0: # ABS_X
+                            # Left/Right -> (0,1)/(1,1)
+                            # Left is negative, Right is positive
+                            # Mapping says: LEFT_STICK_RIGHT -> (0, 1), LEFT_STICK_LEFT -> (1, 1)
+                            # So positive val -> (0, 1), negative val -> (1, 1)
+                            if norm_val > 0:
+                                self._delta_pose_raw[0, 1] = norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[1, 1] = 0
+                            else:
+                                self._delta_pose_raw[1, 1] = -norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[0, 1] = 0
+                        
+                        # Left Stick Y -> Move X
+                        elif event.code == 1: # ABS_Y
+                            # Up is negative, Down is positive
+                            # Mapping: UP -> (0, 0), DOWN -> (1, 0)
+                            # So negative val -> (0, 0), positive val -> (1, 0)
+                            if norm_val < 0:
+                                self._delta_pose_raw[0, 0] = -norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[1, 0] = 0
+                            else:
+                                self._delta_pose_raw[1, 0] = norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[0, 0] = 0
+
+                        # Right Stick X -> Rotate Z (Yaw)
+                        elif event.code == 3: # ABS_RX
+                            # Left/Right -> (0,5)/(1,5)
+                            # Mapping: RIGHT -> (0, 5), LEFT -> (1, 5)
+                            if norm_val > 0:
+                                self._delta_pose_raw[0, 5] = norm_val * self.rot_sensitivity
+                                self._delta_pose_raw[1, 5] = 0
+                            else:
+                                self._delta_pose_raw[1, 5] = -norm_val * self.rot_sensitivity
+                                self._delta_pose_raw[0, 5] = 0
+
+                        # Right Stick Y -> Move Z
+                        elif event.code == 4: # ABS_RY
+                            # Up is negative, Down is positive
+                            # Mapping: UP -> (0, 2), DOWN -> (1, 2)
+                            if norm_val < 0:
+                                self._delta_pose_raw[0, 2] = -norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[1, 2] = 0
+                            else:
+                                self._delta_pose_raw[1, 2] = norm_val * self.pos_sensitivity
+                                self._delta_pose_raw[0, 2] = 0
+
+                        # D-Pad X -> Rotate X (Roll)
+                        elif event.code == 16: # ABS_HAT0X
+                            # Left (-1) / Right (1)
+                            # Mapping: RIGHT -> (1, 3), LEFT -> (0, 3) (Note: Mapping in _create_key_bindings seems swapped or I misread)
+                            # Let's check _create_key_bindings:
+                            # DPAD_RIGHT: (1, 3) -> Negative Roll?
+                            # DPAD_LEFT: (0, 3) -> Positive Roll?
+                            if norm_val > 0: # Right
+                                self._delta_pose_raw[1, 3] = self.rot_sensitivity * 0.8
+                                self._delta_pose_raw[0, 3] = 0
+                            elif norm_val < 0: # Left
+                                self._delta_pose_raw[0, 3] = self.rot_sensitivity * 0.8
+                                self._delta_pose_raw[1, 3] = 0
+                            else:
+                                self._delta_pose_raw[:, 3] = 0
+
+                        # D-Pad Y -> Rotate Y (Pitch)
+                        elif event.code == 17: # ABS_HAT0Y
+                            # Up (-1) / Down (1)
+                            # Mapping: UP -> (1, 4), DOWN -> (0, 4)
+                            if norm_val < 0: # Up
+                                self._delta_pose_raw[1, 4] = self.rot_sensitivity * 0.8
+                                self._delta_pose_raw[0, 4] = 0
+                            elif norm_val > 0: # Down
+                                self._delta_pose_raw[0, 4] = self.rot_sensitivity * 0.8
+                                self._delta_pose_raw[1, 4] = 0
+                            else:
+                                self._delta_pose_raw[:, 4] = 0
+
+                    elif event.type == evdev.ecodes.EV_KEY:
+                        # X Button -> Toggle Gripper
+                        # BTN_NORTH = 307
+                        if event.code == 307 and event.value == 1: # Pressed
+                            self._close_gripper = not self._close_gripper
+                            print(f"[Se3Gamepad] Gripper toggled: {self._close_gripper}")
+
+        except Exception as e:
+            print(f"[Se3Gamepad] Error reading evdev: {e}")
+
     """
     Internal helpers.
     """
@@ -176,6 +340,9 @@ class Se3Gamepad(DeviceBase):
         """
         # check if the event is a button press
         cur_val = event.value
+        if abs(cur_val) > 0.1:
+            print(f"[Se3Gamepad] Event: {event.input}, Value: {cur_val}")
+        
         if abs(cur_val) < self.dead_zone:
             cur_val = 0
         # -- button

@@ -90,6 +90,12 @@ class GrootPolicyWrapper:
             # Fallback (should not happen if model is standard)
             raise e
 
+        # Define OpenArm Limits for Normalization/Un-normalization
+        # We use symmetric limits [-pi, pi] to ensure 0.0 rad maps to 0.5 (Neutral)
+        # This prevents bias from asymmetric physical limits (e.g. J1 [-1.4, 3.5])
+        self.lower_limits = torch.tensor([-3.14159] * 7, device=device)
+        self.upper_limits = torch.tensor([3.14159] * 7, device=device)
+
         # Force disable flash attention in backbone config
         if hasattr(self.cfg, 'backbone_cfg'):
             print("[Groot] Disabling Flash Attention in config...")
@@ -153,8 +159,10 @@ class GrootPolicyWrapper:
         
         print("[Groot] Model loaded successfully.")
         self.print_keys_once = True
+        self.internal_step_count = 0
 
     def reset(self):
+        self.internal_step_count = 0
         if hasattr(self.policy, "reset"):
             self.policy.reset()
 
@@ -193,6 +201,24 @@ class GrootPolicyWrapper:
         if "policy" in obs:
             # Extract first 14 elements as joint positions (left + right arms)
             joint_pos_arms = obs["policy"][:, :14]
+            
+            # Normalize Input: Radians -> [0, 1]
+            lower_14 = torch.cat([self.lower_limits, self.lower_limits])
+            upper_14 = torch.cat([self.upper_limits, self.upper_limits])
+            joint_pos_norm = (joint_pos_arms - lower_14) / (upper_14 - lower_14)
+            joint_pos_norm = torch.clamp(joint_pos_norm, 0.0, 1.0)
+            
+            lerobot_obs["observation.state"] = joint_pos_norm
+            
+            # Debug: Print Cube Position and Joint State (First env only)
+            if self.internal_step_count < 20 or torch.rand(1).item() < 0.05: # Print first 20 steps then occasionally
+                if "policy" in obs and obs["policy"].shape[-1] > 45:
+                     cube_pos = obs["policy"][0, 42:45]
+                     print(f"[DEBUG] Step {self.internal_step_count} | Cube Pos: {cube_pos.cpu().numpy()}")
+                     print(f"[DEBUG] Step {self.internal_step_count} | Joint Pos (Rad): {joint_pos_arms[0].cpu().numpy()}")
+                     # print(f"[DEBUG] Joint Pos (Norm): {joint_pos_norm[0].cpu().numpy()}")
+            
+            self.internal_step_count += 1
             
             # If we need gripper state and it's not in obs, we might need to fake it or get it from env
             # For now, let's assume Groot might be fine with just arms, or we append 0s for grippers
@@ -308,23 +334,54 @@ def main():
             # If action is 32 dims (Groot default), we need to map it to OpenArm's 16 dims
             # OpenArm expects: [Left Arm (7), Right Arm (7), Left Gripper (1), Right Gripper (1)]
             if action.shape[-1] == 32:
-                # Hypothesis: Groot outputs [Left Arm (7), Left Gripper (1), Right Arm (7), Right Gripper (1), ...]
-                # We remap to [Left Arm (7), Right Arm (7), Left Gripper (1), Right Gripper (1)]
+                # Hypothesis based on GR1 Embodiment (Common Default):
+                # [Left Arm (7), Right Arm (7), Left Hand (6), Right Hand (6), Waist (3), Velocity (3)]
+                # Total: 7+7+6+6+3+3 = 32
                 
+                # Debug: Print raw action stats occasionally
+                if step_count % 50 == 0:
+                    print(f"Step {step_count} | Raw Action [0:7] (Left Arm): {action[0, 0:7].cpu().numpy()}")
+                    print(f"Step {step_count} | Raw Action [7:14] (Right Arm?): {action[0, 7:14].cpu().numpy()}")
+                    print(f"Step {step_count} | Raw Action [14:20] (Left Hand?): {action[0, 14:20].cpu().numpy()}")
+                    print(f"Step {step_count} | Raw Action [20:26] (Right Hand?): {action[0, 20:26].cpu().numpy()}")
+
                 left_arm = action[:, 0:7]
-                left_gripper = action[:, 7:8]
-                right_arm = action[:, 8:15]
-                right_gripper = action[:, 15:16]
+                right_arm = action[:, 7:14]
+                
+                # Map Grippers
+                # We take the first joint of the hand as the gripper value. 
+                # If the hand is 6-DOF, usually the first joint is a major movement or we can average.
+                # For now, let's try index 14 (Left Hand 0) and 20 (Right Hand 0).
+                # We subtract 0.5 to center the [0,1] output around 0 for BinaryJointPositionActionCfg
+                left_gripper = action[:, 14:15] - 0.5
+                right_gripper = action[:, 20:21] - 0.5
+                
+                # Un-normalization Strategy 2: Center-Shifted Scaling
+                # Reverting to this as Min-Max (Strategy 3) caused offset issues due to asymmetric limits.
+                # The model likely outputs [0, 1] where 0.5 is neutral (0 rad).
+                # Strategy 3 mapped 0.5 to the midpoint of physical limits, which is often NOT 0 rad.
+                
+                scale_factor = 6.28 # 2*pi covering [-pi, pi]
+                
+                left_arm = (left_arm - 0.5) * scale_factor
+                right_arm = (right_arm - 0.5) * scale_factor
+                
+                # Mirror Right Arm Actions (J1, J3, J5, J7)
+                # Assuming GR1 Right Arm is symmetric (mirrored) to Left Arm
+                # OpenArm Right Arm is a copy (translated), so we need to invert lateral joints
+                # Indices: 0 (J1), 2 (J3), 4 (J5), 6 (J7)
+                # right_arm[:, 0] *= -1.0
+                # right_arm[:, 2] *= -1.0
+                # right_arm[:, 4] *= -1.0
+                # right_arm[:, 6] *= -1.0
                 
                 # Reassemble for OpenArm
                 action = torch.cat([left_arm, right_arm, left_gripper, right_gripper], dim=-1)
                 
                 # DEBUG: Print Gripper Actions
                 if step_count % 20 == 0:
-                    print(f"Step {step_count} | Gripper Raw: L={left_gripper.item():.3f}, R={right_gripper.item():.3f}")
+                    print(f"Step {step_count} | Mapped Gripper (Shifted): L={left_gripper.item():.3f}, R={right_gripper.item():.3f}")
 
-                # Reassemble for OpenArm
-                action = torch.cat([left_arm, right_arm, left_gripper, right_gripper], dim=-1)
             if action.shape[-1] == 14:
                 # Append gripper actions (open/close)
                 # For now, keep them open (positive) or closed (0)

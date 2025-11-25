@@ -5,7 +5,7 @@ import base64
 import requests
 
 # Configuration
-CALIB_DIR = "/home/kimate/open_arm_10Things/IsaacLab/calibration_images"
+CALIB_DIR = "/home/kimate/open_arm_10Things/IsaacLab/output_images"
 API_KEY = os.environ.get("OPENAI_API_KEY")
 
 def encode_image(image_path):
@@ -25,20 +25,26 @@ def analyze_images(image_paths):
     messages = [
         {
             "role": "system",
-            "content": "You are a robotics computer vision expert. You are calibrating a wrist-mounted camera on a robotic arm. The goal is to have a clear view of the gripper fingers and the workspace immediately in front of them (where an object would be grasped)."
+            "content": "You are a robotics expert analyzing a robot arm's behavior. The user reports the robot is 'reaching both arms as far apart from each other as possible' instead of reaching for the cube. Analyze the images to confirm this behavior and look for signs of joint limit issues or incorrect mapping (e.g. arms crossed, twisted, or moving in opposite directions)."
         },
         {
             "role": "user",
             "content": [
                 {
                     "type": "text",
-                    "text": "I have generated a set of camera views with different pitch angles. Please analyze these images. For each image, tell me:\n1. Can you see the gripper fingers?\n2. Can you see the target area (the cube)?\n3. Is the camera tilted too far down (seeing only robot parts) or too far up (seeing over the workspace)?\n\nFinally, recommend which pitch angle provides the best trade-off."
+                    "text": "I have generated a set of camera views from an evaluation run. Please analyze these images. For each image, tell me:\n1. Where are the arms relative to the cube? (Reaching towards, reaching away, far apart?)\n2. Does the robot look like it is in a valid pose or a weird/broken pose?\n3. Are the grippers open or closed?\n\nFinally, summarize if the behavior matches 'arms reaching apart' and hypothesize why (e.g. coordinate frame mismatch, sign inversion)."
                 }
             ]
         }
     ]
 
-    for img_path in image_paths:
+    # Limit to first 5 and last 5 images to save tokens/time
+    if len(image_paths) > 10:
+        selected_images = image_paths[:5] + image_paths[-5:]
+    else:
+        selected_images = image_paths
+
+    for img_path in selected_images:
         filename = os.path.basename(img_path)
         base64_image = encode_image(img_path)
         messages[1]["content"].append({
@@ -58,7 +64,7 @@ def analyze_images(image_paths):
         "max_tokens": 1000
     }
 
-    print(f"Sending {len(image_paths)} images to GPT-4o for analysis...")
+    print(f"Sending {len(selected_images)} images to GPT-4o for analysis...")
     try:
         response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=60)
     except requests.exceptions.RequestException as e:
@@ -72,11 +78,11 @@ def analyze_images(image_paths):
         print(f"Error: {response.status_code} - {response.text}")
 
 def main():
-    # Find all right wrist images
-    images = sorted(glob.glob(os.path.join(CALIB_DIR, "*_right.png")))
+    # Find overhead images
+    images = sorted(glob.glob(os.path.join(CALIB_DIR, "ep0_step*_overhead_rgb.png")))
     
     if not images:
-        print(f"No images found in {CALIB_DIR}. Did you run calibrate_wrist_cameras.py?")
+        print(f"No images found in {CALIB_DIR}. Did you run evaluate_groot.py?")
         return
 
     print(f"Found {len(images)} images.")

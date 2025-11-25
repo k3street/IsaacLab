@@ -126,7 +126,6 @@ parser.add_argument(
     default=False,
     help="Enable Pinocchio.",
 )
-
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -165,7 +164,11 @@ import torch
 import omni
 import omni.ui as ui
 
-from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg
+from isaaclab.devices import Se3Keyboard, Se3KeyboardCfg, Se3SpaceMouse, Se3SpaceMouseCfg, Se3Gamepad, Se3GamepadCfg
+print(f"Se3Gamepad imported from: {Se3Gamepad}")
+import inspect
+print(f"Se3Gamepad file: {inspect.getfile(Se3Gamepad)}")
+
 from isaaclab.devices.openxr import remove_camera_configs
 from isaaclab.devices.teleop_device_factory import create_teleop_device
 
@@ -361,6 +364,8 @@ def setup_teleop_device(callbacks: dict[str, Callable]) -> object:
                 teleop_interface = Se3Keyboard(Se3KeyboardCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
             elif device_name == "spacemouse":
                 teleop_interface = Se3SpaceMouse(Se3SpaceMouseCfg(pos_sensitivity=0.2, rot_sensitivity=0.5))
+            elif device_name == "gamepad":
+                teleop_interface = Se3Gamepad(Se3GamepadCfg(pos_sensitivity=0.1, rot_sensitivity=0.1))
             elif device_name == "mediapipe":
                 try:
                     from openarm.teleop.mediapipe_se3 import MediaPipeSe3Teleop, MediaPipeSe3TeleopCfg  # type: ignore[attr-defined]
@@ -431,25 +436,37 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
     """
 
     env_impl = env.unwrapped
+    expected_dim = getattr(env_impl.action_manager, "total_action_dim", None)
 
-    # Handle bimanual teleoperation by retargeting both wrists to joint actions via differential IK.
-    if args_cli.mediapipe_mode == "bimanual":
+    # Handle bimanual teleoperation (OpenArm Bi: 16 dims)
+    # We check for 16 dims (7+7+1+1) or explicit bimanual flag
+    if expected_dim == 16 or args_cli.mediapipe_mode == "bimanual":
+        # Ensure we are in a dual-arm env
         actions_cfg = getattr(env_impl.cfg, "actions", None)
         has_dual_arm = actions_cfg is not None and hasattr(actions_cfg, "left_arm_action") and hasattr(actions_cfg, "right_arm_action")
-        if not has_dual_arm:
-            omni.log.error(
-                "MediaPipe bimanual teleop requires a dual-arm environment (e.g., Isaac-Grasp-Cube-OpenArm-Bi-v0). "
-                "Switch to a bimanual task or launch with --mediapipe_mode single."
-            )
-            exit(1)
-
-        adapter = _BimanualIkAdapterCache.get_or_create(env_impl)
-        return adapter.delta_pose_to_action(command)
+        
+        if has_dual_arm:
+            adapter = _BimanualIkAdapterCache.get_or_create(env_impl)
+            
+            # If command is 7-dim (Gamepad/SpaceMouse), expand to 14-dim
+            # Mapping: Gamepad -> Right Arm, Left Arm Stationary
+            if command.numel() == 7:
+                new_cmd = torch.zeros(14, device=command.device)
+                # Right Pose (7-13) gets the delta
+                new_cmd[7:13] = command[:6]
+                # Right Gripper (13)
+                new_cmd[13] = command[6]
+                # Left Gripper (6) - Sync with Right
+                new_cmd[6] = command[6]
+                # Left Pose (0-6) remains 0 (stationary)
+                
+                return adapter.delta_pose_to_action(new_cmd)
+                
+            return adapter.delta_pose_to_action(command)
 
     # Handle single-arm teleoperation with IK for non-Mimic environments
     # This is specifically for cases like OpenArm where we have 8 actions (7 joints + 1 gripper)
     # but the teleop gives 7 (6 pose + 1 gripper).
-    expected_dim = getattr(env_impl.action_manager, "total_action_dim", None)
     if expected_dim == 8 and command.numel() == 7:
          adapter = _SingleArmIkAdapterCache.get_or_create(env_impl)
          return adapter.delta_pose_to_action(command)
@@ -460,7 +477,6 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
     if command.dim() > 2 or command.numel() < 7:
         return None
 
-    expected_dim = getattr(env_impl.action_manager, "total_action_dim", None)
     if expected_dim is not None and command.numel() == expected_dim:
         return None
 
@@ -986,9 +1002,18 @@ def run_simulation_loop(
         while simulation_app.is_running():
             # Get keyboard command
             action = teleop_interface.advance()
+            
+            # DEBUG: Print raw action if non-zero
+            if torch.any(torch.abs(action) > 0.01):
+                print(f"Raw Teleop Action: {action.cpu().numpy()}")
+
             converted_action = convert_se3_command_to_env_action(env, action)
             if converted_action is not None:
                 action = converted_action
+                # DEBUG: Print converted action
+                if torch.any(torch.abs(action) > 0.01):
+                    print(f"Converted Action: {action.cpu().numpy()}")
+            
             action = action.to(env.unwrapped.device)
             # Expand to batch dimension
             actions = action.unsqueeze(0).repeat(env.num_envs, 1)
