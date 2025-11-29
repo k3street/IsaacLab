@@ -164,6 +164,11 @@ class Se3Gamepad(DeviceBase):
         self._delta_pose_raw = np.zeros([2, 6])
         # dictionary for additional callbacks
         self._additional_callbacks = dict()
+        # Track analog trigger activation so we can fire callbacks once per press
+        self._trigger_state = {
+            carb.input.GamepadInput.LEFT_TRIGGER: {"value": 0.0, "active": False},
+            carb.input.GamepadInput.RIGHT_TRIGGER: {"value": 0.0, "active": False},
+        }
 
     def __del__(self):
         """Unsubscribe from gamepad events."""
@@ -247,6 +252,14 @@ class Se3Gamepad(DeviceBase):
                                 norm_val = 0.0
                         elif event.code in [16, 17]: # D-Pad
                             norm_val = float(val)
+                        elif event.code in [2, 5]:  # Triggers (ABS_Z, ABS_RZ)
+                            if val <= 255:
+                                max_val = 255.0
+                            elif val <= 1023:
+                                max_val = 1023.0
+                            else:
+                                max_val = 65535.0
+                            norm_val = max(0.0, min(1.0, val / max_val))
                         
                         # Map to internal state
                         # Left Stick X -> Move Y
@@ -324,6 +337,12 @@ class Se3Gamepad(DeviceBase):
                                 self._delta_pose_raw[1, 4] = 0
                             else:
                                 self._delta_pose_raw[:, 4] = 0
+                        # Left Trigger
+                        elif event.code == 2:
+                            self._update_trigger_state(carb.input.GamepadInput.LEFT_TRIGGER, norm_val)
+                        # Right Trigger
+                        elif event.code == 5:
+                            self._update_trigger_state(carb.input.GamepadInput.RIGHT_TRIGGER, norm_val)
 
                     elif event.type == evdev.ecodes.EV_KEY:
                         # X Button -> Toggle Gripper
@@ -371,9 +390,13 @@ class Se3Gamepad(DeviceBase):
                 self._delta_pose_raw[1 - direction, axis] = 0
             else:
                 self._delta_pose_raw[:, axis] = 0
-        # additional callbacks
-        if event.input in self._additional_callbacks:
+        # additional callbacks (non-trigger buttons)
+        if event.input in self._additional_callbacks and event.input not in self._trigger_state:
             self._additional_callbacks[event.input]()
+
+        if event.input in self._trigger_state:
+            norm_val = max(0.0, min(1.0, cur_val if cur_val >= 0 else 0.0))
+            self._update_trigger_state(event.input, norm_val)
 
         # since no error, we are fine :)
         return True
@@ -438,3 +461,20 @@ class Se3Gamepad(DeviceBase):
         delta_command[delta_command_sign] *= -1
 
         return delta_command
+
+    def _update_trigger_state(self, trigger_input: carb.input.GamepadInput, value: float) -> None:
+        """Track trigger activations and fire callbacks once per press."""
+
+        state = self._trigger_state.get(trigger_input)
+        if state is None:
+            return
+
+        state["value"] = value
+        pressed = value > 0.4
+        was_active = state["active"]
+        state["active"] = pressed
+
+        if pressed and not was_active:
+            callback = self._additional_callbacks.get(trigger_input)
+            if callback:
+                callback()

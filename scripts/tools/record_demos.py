@@ -29,6 +29,8 @@ import contextlib
 import sys
 import os
 
+import carb
+
 # Add IsaacLab source to path
 source_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../source"))
 sys.path.append(os.path.join(source_dir, "isaaclab"))
@@ -194,6 +196,34 @@ from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 # import logger
 logger = logging.getLogger(__name__)
+# Track which arm receives single-hand teleop commands when using the gamepad fallback.
+_ACTIVE_BIMANUAL_ARM = "right"
+
+
+def _get_active_bimanual_arm() -> str:
+    return _ACTIVE_BIMANUAL_ARM
+
+
+def _set_active_bimanual_arm(target_arm: str) -> None:
+    """Set which arm receives single-hand teleop commands."""
+    if target_arm not in {"left", "right"}:
+        raise ValueError(f"Unsupported arm selection: {target_arm}")
+
+    global _ACTIVE_BIMANUAL_ARM
+    if _ACTIVE_BIMANUAL_ARM == target_arm:
+        return
+
+    _ACTIVE_BIMANUAL_ARM = target_arm
+    print(f"[Teleop] Active arm switched to {_ACTIVE_BIMANUAL_ARM}.")
+
+
+def _select_left_arm() -> None:
+    _set_active_bimanual_arm("left")
+
+
+def _select_right_arm() -> None:
+    _set_active_bimanual_arm("right")
+
 
 if TYPE_CHECKING:  # pragma: no cover
     from openarm.teleop.mediapipe_se3 import MediaPipeSe3Teleop, MediaPipeSe3TeleopCfg
@@ -452,13 +482,15 @@ def convert_se3_command_to_env_action(env: gym.Env, command: torch.Tensor) -> to
             # Mapping: Gamepad -> Right Arm, Left Arm Stationary
             if command.numel() == 7:
                 new_cmd = torch.zeros(14, device=command.device)
-                # Right Pose (7-13) gets the delta
-                new_cmd[7:13] = command[:6]
-                # Right Gripper (13)
-                new_cmd[13] = command[6]
-                # Left Gripper (6) - Sync with Right
+                active_arm = _get_active_bimanual_arm()
+                if active_arm == "left":
+                    new_cmd[:6] = command[:6]
+                else:
+                    new_cmd[7:13] = command[:6]
+
+                # Always keep grippers synced so operators can swap arms seamlessly
                 new_cmd[6] = command[6]
-                # Left Pose (0-6) remains 0 (stationary)
+                new_cmd[13] = command[6]
                 
                 return adapter.delta_pose_to_action(new_cmd)
                 
@@ -987,6 +1019,14 @@ def run_simulation_loop(
 
     teleop_interface = setup_teleop_device(teleoperation_callbacks)
     teleop_interface.add_callback("R", reset_recording_instance)
+
+    if isinstance(teleop_interface, Se3Gamepad):
+        try:
+            teleop_interface.add_callback(carb.input.GamepadInput.LEFT_TRIGGER, _select_left_arm)
+            teleop_interface.add_callback(carb.input.GamepadInput.RIGHT_TRIGGER, _select_right_arm)
+            print("[Teleop] LT selects the left arm, RT selects the right arm.")
+        except Exception as exc:
+            logger.warning("Failed to bind trigger arm selectors: %s", exc)
 
     # Reset before starting
     env.sim.reset()
